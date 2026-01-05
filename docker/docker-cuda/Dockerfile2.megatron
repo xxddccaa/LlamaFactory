@@ -1,0 +1,22 @@
+FROM kevinchina/deeplearning:llamafactory0-9-4-base-1-megatron-1
+
+# pip install LLaMA-Factory
+WORKDIR /app
+
+# Copy the application into the image
+COPY . /app
+
+# Install LLaMA Factory
+RUN pip install --no-cache-dir -e ".[metrics]" --no-build-isolation
+
+# Expose port 7860 for LLaMA Board
+ENV GRADIO_SERVER_PORT=7860
+EXPOSE 7860
+
+# Expose port 8000 for API service
+ENV API_PORT=8000
+EXPOSE 8000
+
+# unset proxy
+ENV http_proxy=
+ENV https_proxy=
