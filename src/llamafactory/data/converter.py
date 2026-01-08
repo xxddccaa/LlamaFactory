@@ -51,27 +51,34 @@ class DatasetConverter:
         else:
             medias = medias[:]
 
-        if self.dataset_attr.load_from in ["script", "file"]:
+        # Use dataset-specific media_dir if available, otherwise use global media_dir
+        media_dir = self.dataset_attr.media_dir if self.dataset_attr.media_dir else self.data_args.media_dir
+
+        if self.dataset_attr.load_from in ["script", "file"] and media_dir:
             if isinstance(medias[0], str):
                 for i in range(len(medias)):
-                    media_path = os.path.join(self.data_args.media_dir, medias[i])
-                    if os.path.isfile(media_path):
+                    # Check if the media path is already an absolute path (including remote paths)
+                    is_remote = medias[i].startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://", "http://", "https://"))
+                    is_absolute = os.path.isabs(medias[i]) or is_remote
+                    
+                    if not is_absolute:
+                        # For relative paths, always use media_dir to join (even if file doesn't exist)
+                        media_path = os.path.join(media_dir, medias[i])
                         medias[i] = media_path
-                    else:
-                        logger.warning_rank0_once(
-                            f"Media {medias[i]} does not exist in `media_dir`. Use original path."
-                        )
+                    # If already absolute, keep the original path
             elif isinstance(medias[0], list):  # for processed video frames
                 # medias is a list of lists, e.g., [[frame1.jpg, frame2.jpg], [frame3.jpg, frame4.jpg]]
                 for i in range(len(medias)):
                     for j in range(len(medias[i])):
-                        media_path = os.path.join(self.data_args.media_dir, medias[i][j])
-                        if os.path.isfile(media_path):
+                        # Check if the media path is already an absolute path (including remote paths)
+                        is_remote = medias[i][j].startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://", "http://", "https://"))
+                        is_absolute = os.path.isabs(medias[i][j]) or is_remote
+                        
+                        if not is_absolute:
+                            # For relative paths, always use media_dir to join (even if file doesn't exist)
+                            media_path = os.path.join(media_dir, medias[i][j])
                             medias[i][j] = media_path
-                        else:
-                            logger.warning_rank0_once(
-                                f"Media {medias[i][j]} does not exist in `media_dir`. Use original path."
-                            )
+                        # If already absolute, keep the original path
 
         return medias
 

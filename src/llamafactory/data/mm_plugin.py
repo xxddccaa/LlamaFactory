@@ -253,7 +253,24 @@ class MMPluginMixin:
         r"""Regularize images to avoid error. Including reading and pre-processing."""
         results = []
         for image in images:
-            if isinstance(image, (str, BinaryIO)):
+            if isinstance(image, str):
+                # Check if it's a remote path (s3://, oss://, etc.)
+                is_remote = image.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://", "http://", "https://"))
+                if is_remote:
+                    # Use megfile for remote paths to support custom endpoints (e.g., OSS)
+                    try:
+                        import megfile
+                    except ImportError:
+                        raise ImportError(
+                            "megfile is required for loading remote images (S3/OSS). "
+                            "Please install it with: pip install megfile"
+                        )
+                    # Read from remote path using megfile
+                    with megfile.smart_open(image, 'rb') as f:
+                        image = Image.open(BytesIO(f.read()))
+                else:
+                    image = Image.open(image)
+            elif isinstance(image, BinaryIO):
                 image = Image.open(image)
             elif isinstance(image, bytes):
                 image = Image.open(BytesIO(image))
@@ -261,7 +278,21 @@ class MMPluginMixin:
                 if image["bytes"] is not None:
                     image = Image.open(BytesIO(image["bytes"]))
                 else:
-                    image = Image.open(image["path"])
+                    path = image["path"]
+                    # Check if it's a remote path
+                    is_remote = path.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://", "http://", "https://"))
+                    if is_remote:
+                        try:
+                            import megfile
+                        except ImportError:
+                            raise ImportError(
+                                "megfile is required for loading remote images (S3/OSS). "
+                                "Please install it with: pip install megfile"
+                            )
+                        with megfile.smart_open(path, 'rb') as f:
+                            image = Image.open(BytesIO(f.read()))
+                    else:
+                        image = Image.open(path)
 
             if not isinstance(image, ImageObject):
                 raise ValueError(f"Expect input is a list of images, but got {type(image)}.")

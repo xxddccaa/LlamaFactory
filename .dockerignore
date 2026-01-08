@@ -13,3 +13,5 @@ output
 .dockerignore
 .gitattributes
 .gitignore
+
+swift/

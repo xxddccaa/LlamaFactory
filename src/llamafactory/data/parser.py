@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from huggingface_hub import hf_hub_download
 
-from ..extras.constants import DATA_CONFIG
+from ..extras.constants import DATA_CONFIG, FILEEXT2TYPE
 from ..extras.misc import use_modelscope, use_openmind
 
 
@@ -37,6 +37,7 @@ class DatasetAttr:
     split: str = "train"
     folder: str | None = None
     num_samples: int | None = None
+    media_dir: str | None = None  # Media directory for this dataset
     # common columns
     system: str | None = None
     tools: str | None = None
@@ -76,6 +77,7 @@ class DatasetAttr:
         self.set_attr("split", attr, default="train")
         self.set_attr("folder", attr)
         self.set_attr("num_samples", attr)
+        self.set_attr("media_dir", attr)
 
         if "columns" in attr:
             column_names = ["prompt", "query", "response", "history", "messages", "system", "tools"]
@@ -88,6 +90,32 @@ class DatasetAttr:
             tag_names += ["user_tag", "assistant_tag", "observation_tag", "function_tag", "system_tag"]
             for tag in tag_names:
                 self.set_attr(tag, attr["tags"])
+
+
+def _is_file_path(path: str) -> bool:
+    r"""Check if the path is a file path (local or remote)."""
+    # Check for remote paths (s3://, oss://, gs://, gcs://, etc.)
+    if path.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://")):
+        return True
+    
+    # Check if it looks like an absolute path (starts with /)
+    # This is important for paths that might not exist yet
+    if os.path.isabs(path):
+        return True
+    
+    # Check for local file paths that exist
+    if os.path.isfile(path) or os.path.isdir(path):
+        return True
+    
+    # Check if it has a file extension, which suggests it's a file path
+    # Common data file extensions
+    file_extensions = ('.json', '.jsonl', '.csv', '.parquet', '.arrow', '.txt')
+    if any(path.lower().endswith(ext) for ext in file_extensions):
+        # Further check: if it contains path separators, likely a file path
+        if '/' in path or '\\' in path:
+            return True
+    
+    return False
 
 
 def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -> list["DatasetAttr"]:
@@ -109,19 +137,45 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
             with open(config_path) as f:
                 dataset_info = json.load(f)
         except Exception as err:
+            # If dataset_info.json doesn't exist, we'll still try to handle file paths directly
+            # Only raise error if there are dataset_names that are not file paths
             if len(dataset_names) != 0:
-                raise ValueError(f"Cannot open {config_path} due to {str(err)}.")
-
-            dataset_info = None
+                # Check if any dataset_names are not file paths (need dataset_info.json)
+                has_non_file_paths = any(not _is_file_path(name) for name in dataset_names)
+                if has_non_file_paths:
+                    raise ValueError(f"Cannot open {config_path} due to {str(err)}.")
+                # All are file paths, can handle directly
+                dataset_info = None
+            else:
+                dataset_info = None
 
     dataset_list: list[DatasetAttr] = []
     for name in dataset_names:
-        if dataset_info is None:  # dataset_dir is ONLINE
+        # First check if name is a file path (allowing mixed usage)
+        if _is_file_path(name):
+            # Direct file path: use file loader with default sharegpt format
+            dataset_attr = DatasetAttr(
+                load_from="file",
+                dataset_name=name,
+                formatting="sharegpt",
+                messages="conversations",
+                role_tag="from",
+                content_tag="value",
+                user_tag="human",
+                assistant_tag="gpt",
+            )
+            dataset_list.append(dataset_attr)
+            continue
+
+        # Not a file path, check dataset_info.json
+        if dataset_info is None:  # dataset_dir is ONLINE or dataset_info.json not found
+            # Not a file path and no dataset_info.json, treat as hub dataset
             load_from = "ms_hub" if use_modelscope() else "om_hub" if use_openmind() else "hf_hub"
             dataset_attr = DatasetAttr(load_from, dataset_name=name)
             dataset_list.append(dataset_attr)
             continue
 
+        # Try to find in dataset_info.json
         if name not in dataset_info:
             raise ValueError(f"Undefined dataset {name} in {DATA_CONFIG}.")
 
@@ -144,6 +198,18 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
             dataset_attr = DatasetAttr("file", dataset_name=dataset_info[name]["file_name"])
 
         dataset_attr.join(dataset_info[name])
+        
+        # Resolve media_dir if it's a relative path: make it relative to dataset_dir
+        # Similar to how file_name is resolved in loader.py
+        if dataset_attr.media_dir and not isinstance(dataset_dir, dict) and dataset_dir != "ONLINE":
+            # Check if media_dir is a remote path or absolute path
+            is_remote = dataset_attr.media_dir.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://", "http://", "https://"))
+            is_absolute = os.path.isabs(dataset_attr.media_dir) or is_remote
+            
+            if not is_absolute:
+                # For relative paths, resolve relative to dataset_dir
+                dataset_attr.media_dir = os.path.join(dataset_dir, dataset_attr.media_dir)
+        
         dataset_list.append(dataset_attr)
 
     return dataset_list

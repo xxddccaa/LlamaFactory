@@ -57,6 +57,7 @@ def _load_single_dataset(
     r"""Load a single dataset and aligns it to the standard format."""
     logger.info_rank0(f"Loading dataset {dataset_attr}...")
     data_path, data_name, data_dir, data_files = None, None, None, None
+    is_remote = False  # Track if we're loading from remote storage (S3/OSS)
     if dataset_attr.load_from in ["hf_hub", "ms_hub", "om_hub"]:
         data_path = dataset_attr.dataset_name
         data_name = dataset_attr.subset
@@ -72,8 +73,43 @@ def _load_single_dataset(
 
     elif dataset_attr.load_from == "file":
         data_files = []
-        local_path = os.path.join(data_args.dataset_dir, dataset_attr.dataset_name)
-        if os.path.isdir(local_path):  # is directory
+        # Check if dataset_name is an absolute path or remote path (s3://, oss://, etc.)
+        is_remote = dataset_attr.dataset_name.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://"))
+        is_absolute = os.path.isabs(dataset_attr.dataset_name) or is_remote
+        
+        if is_absolute:
+            local_path = dataset_attr.dataset_name
+        else:
+            local_path = os.path.join(data_args.dataset_dir, dataset_attr.dataset_name)
+        
+        # Handle remote paths (s3://, oss://, etc.)
+        # Use megfile for remote paths to support custom endpoints (e.g., OSS)
+        if is_remote:
+            # For remote paths, use megfile which supports custom endpoints via AWS_ENDPOINT_URL
+            # This is more flexible than HuggingFace datasets' fsspec implementation
+            try:
+                import megfile
+            except ImportError:
+                raise ImportError(
+                    "megfile is required for loading remote files (S3/OSS). "
+                    "Please install it with: pip install megfile"
+                )
+            
+            # Check if it's a directory or file
+            if megfile.smart_isdir(local_path):
+                # Handle directory: find all json/jsonl files
+                prefix = local_path.rstrip("/")
+                jsonl_files = list(megfile.smart_glob(f"{prefix}/**/*.jsonl"))
+                json_files = list(megfile.smart_glob(f"{prefix}/**/*.json"))
+                all_files = jsonl_files + json_files
+                
+                if not all_files:
+                    raise ValueError(f"Remote directory {local_path} contains no .json or .jsonl files.")
+                data_files = all_files
+            else:
+                # Single file
+                data_files.append(local_path)
+        elif os.path.isdir(local_path):  # is directory
             for file_name in os.listdir(local_path):
                 data_files.append(os.path.join(local_path, file_name))
         elif os.path.isfile(local_path):  # is file
@@ -127,6 +163,58 @@ def _load_single_dataset(
         )
     elif dataset_attr.load_from == "cloud_file":
         dataset = Dataset.from_list(read_cloud_json(data_path), split=dataset_attr.split)
+    elif dataset_attr.load_from == "file" and is_remote:
+        # For remote files (S3/OSS), use megfile to read them directly
+        # This supports custom endpoints via AWS_ENDPOINT_URL environment variable
+        import json
+        import megfile
+        
+        datasets = []
+        for file_path in data_files:
+            file_ext = os.path.splitext(file_path)[-1].lstrip('.')
+            if file_ext == 'jsonl':
+                with megfile.smart_open(file_path, 'rb') as f:
+                    data = [json.loads(line.decode('utf-8')) for line in f if line.strip()]
+            elif file_ext == 'json':
+                with megfile.smart_open(file_path, 'rb') as f:
+                    content = f.read().decode('utf-8')
+                    data = json.loads(content)
+                    if not isinstance(data, list):
+                        raise ValueError(f"JSON data must be a list, got {type(data)} for file: {file_path}")
+                    if not all(isinstance(item, dict) for item in data):
+                        raise ValueError(f"All items in JSON list must be dicts, got {[type(item) for item in data[:3]]} for file: {file_path}")
+            else:
+                # For other formats (csv, parquet, etc.), fall back to HuggingFace datasets
+                # which uses fsspec (may not support custom endpoints)
+                logger.warning_rank0(
+                    f"File format {file_ext} for remote path {file_path} may not support custom endpoints. "
+                    "Consider using json/jsonl format or ensure AWS_ENDPOINT_URL is set for fsspec."
+                )
+                # Fall back to HuggingFace datasets
+                dataset = load_dataset(
+                    path=data_path,
+                    name=data_name,
+                    data_dir=data_dir,
+                    data_files=[file_path],
+                    split=dataset_attr.split,
+                    cache_dir=model_args.cache_dir,
+                    token=model_args.hf_hub_token,
+                    num_proc=data_args.preprocessing_num_workers,
+                    streaming=False,  # Remote files should not use streaming
+                )
+                datasets.append(dataset)
+                continue
+            
+            datasets.append(Dataset.from_list(data))
+            logger.info_rank0(f"Loaded remote file {file_path}, data_length: {len(data)}")
+        
+        # Concatenate all datasets
+        if len(datasets) == 1:
+            dataset = datasets[0]
+        else:
+            from datasets import concatenate_datasets
+            dataset = concatenate_datasets(datasets)
+            logger.info_rank0(f"Merged {len(datasets)} remote files, total length: {len(dataset)}")
     else:
         dataset = load_dataset(
             path=data_path,
