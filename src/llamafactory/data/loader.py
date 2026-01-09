@@ -332,10 +332,25 @@ def _get_preprocessed_dataset(
         data_args, stage, template, tokenizer, processor, do_generate=(training_args.predict_with_generate and is_eval)
     )
     column_names = list(next(iter(dataset)).keys())
+    
+    # Check if dataset has mask_history_sample field
+    has_mask_history_sample = "_mask_history_sample" in column_names
+    
     kwargs = {}
     if not data_args.streaming:
+        # For mask_history_sample mode, use single process to avoid PyArrow schema conflicts
+        # This is because mask_history_sample datasets may have variable-length samples
+        # that can cause type inference issues in multiprocessing
+        num_proc = 1 if has_mask_history_sample else data_args.preprocessing_num_workers
+        
+        if has_mask_history_sample and data_args.preprocessing_num_workers > 1:
+            logger.info_rank0(
+                f"Detected mask_history_sample mode. Using single process (num_proc=1) for tokenization "
+                f"to avoid PyArrow schema conflicts. Original num_proc={data_args.preprocessing_num_workers}."
+            )
+        
         kwargs = dict(
-            num_proc=data_args.preprocessing_num_workers,
+            num_proc=num_proc,
             load_from_cache_file=(not data_args.overwrite_cache) or (training_args.local_process_index != 0),
             desc="Running tokenizer on dataset",
         )

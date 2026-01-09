@@ -39,49 +39,91 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         images: list["ImageInput"],
         videos: list["VideoInput"],
         audios: list["AudioInput"],
+        mask_history_sample: bool = False,
     ) -> tuple[list[int], list[int]]:
         messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
-        input_ids, labels = self.template.mm_plugin.process_token_ids(
+        mm_input_ids, mm_labels = self.template.mm_plugin.process_token_ids(
             [], [], images, videos, audios, self.tokenizer, self.processor
         )
-        encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
-        total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
-        if self.data_args.mask_history:
-            encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
-
-        for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
-            if total_length >= self.data_args.cutoff_len:
-                break
-
+        
+        # Use encode_oneturn for mask_history_sample mode
+        # All samples from mask_history_sample splitting should use encode_oneturn
+        if mask_history_sample:
+            # Use encode_oneturn for mask_history_sample mode
+            # This handles prompts that may start with assistant messages
+            prompt_ids, response_ids = self.template.encode_oneturn(self.tokenizer, messages, system, tools)
+            
+            # Apply truncation: consider mm_input_ids as part of the prompt
+            total_prompt_len = len(mm_input_ids) + len(prompt_ids)
             source_len, target_len = infer_seqlen(
-                len(source_ids), len(target_ids), self.data_args.cutoff_len - total_length
+                total_prompt_len, len(response_ids), self.data_args.cutoff_len
             )
-            source_ids = source_ids[:source_len]
-            target_ids = target_ids[:target_len]
-            total_length += source_len + target_len
-
+            
+            # Truncate prompt_ids if needed
+            if source_len < total_prompt_len:
+                # Need to truncate prompt_ids
+                prompt_ids = prompt_ids[:max(0, source_len - len(mm_input_ids))]
+                source_len = len(mm_input_ids) + len(prompt_ids)
+            
+            # Truncate response_ids if needed
+            response_ids = response_ids[:target_len]
+            
+            # Combine mm_plugin token ids with encoded prompt and response
+            input_ids = mm_input_ids + prompt_ids + response_ids
+            
+            # Build labels: mask everything except the response (mask_history_sample=True)
+            # Only compute loss on the last assistant response
             if self.data_args.train_on_prompt:
-                source_label = source_ids
-            elif self.template.efficient_eos and turn_idx != 0:
-                source_label = [self.tokenizer.eos_token_id] + [IGNORE_INDEX] * (source_len - 1)
+                labels = mm_labels + prompt_ids + response_ids
             else:
-                source_label = [IGNORE_INDEX] * source_len
+                labels = [IGNORE_INDEX] * source_len + response_ids
+            
+            if self.template.efficient_eos:
+                input_ids += [self.tokenizer.eos_token_id]
+                labels += [self.tokenizer.eos_token_id]
+        else:
+            # Standard multiturn encoding (user-assistant alternating)
+            encoded_pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
+            total_length = len(mm_input_ids) + (1 if self.template.efficient_eos else 0)
+            if self.data_args.mask_history:
+                encoded_pairs = encoded_pairs[::-1]  # high priority for last turns
 
-            if self.data_args.mask_history and turn_idx != 0:  # train on the last turn only
-                target_label = [IGNORE_INDEX] * target_len
-            else:
-                target_label = target_ids
+            input_ids = mm_input_ids[:]
+            labels = mm_labels[:]
 
-            if self.data_args.mask_history:  # reversed sequences
-                input_ids = source_ids + target_ids + input_ids
-                labels = source_label + target_label + labels
-            else:
-                input_ids += source_ids + target_ids
-                labels += source_label + target_label
+            for turn_idx, (source_ids, target_ids) in enumerate(encoded_pairs):
+                if total_length >= self.data_args.cutoff_len:
+                    break
 
-        if self.template.efficient_eos:
-            input_ids += [self.tokenizer.eos_token_id]
-            labels += [self.tokenizer.eos_token_id]
+                source_len, target_len = infer_seqlen(
+                    len(source_ids), len(target_ids), self.data_args.cutoff_len - total_length
+                )
+                source_ids = source_ids[:source_len]
+                target_ids = target_ids[:target_len]
+                total_length += source_len + target_len
+
+                if self.data_args.train_on_prompt:
+                    source_label = source_ids
+                elif self.template.efficient_eos and turn_idx != 0:
+                    source_label = [self.tokenizer.eos_token_id] + [IGNORE_INDEX] * (source_len - 1)
+                else:
+                    source_label = [IGNORE_INDEX] * source_len
+
+                if self.data_args.mask_history and turn_idx != 0:  # train on the last turn only
+                    target_label = [IGNORE_INDEX] * target_len
+                else:
+                    target_label = target_ids
+
+                if self.data_args.mask_history:  # reversed sequences
+                    input_ids = source_ids + target_ids + input_ids
+                    labels = source_label + target_label + labels
+                else:
+                    input_ids += source_ids + target_ids
+                    labels += source_label + target_label
+
+            if self.template.efficient_eos:
+                input_ids += [self.tokenizer.eos_token_id]
+                labels += [self.tokenizer.eos_token_id]
 
         return input_ids, labels
 
@@ -90,11 +132,29 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         # for multiturn examples, we only mask the prompt part in each prompt-response pair.
         model_inputs = defaultdict(list)
         for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+            prompt = examples["_prompt"][i]
+            response = examples["_response"][i]
+            
+            # Basic validation: response should have exactly one assistant message
+            # Prompt should end with user message (can start with assistant messages for mask_history_sample)
+            if len(response) != 1:
                 logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    "Dropped invalid example: response should have exactly one message. Got: {}".format(prompt + response)
                 )
                 continue
+            
+            # Check if this sample is from mask_history_sample splitting
+            mask_history_sample = examples.get("_mask_history_sample", [False] * len(examples["_prompt"]))[i]
+            
+            if len(prompt) > 0:
+                # Prompt should end with user message (unless it's mask_history_sample mode)
+                from ..data_utils import Role
+                last_prompt_role = prompt[-1].get("role")
+                if not mask_history_sample and last_prompt_role != Role.USER.value:
+                    logger.warning_rank0(
+                        "Dropped invalid example: prompt should end with user message. Got: {}".format(prompt + response)
+                    )
+                    continue
 
             input_ids, labels = self._encode_data_example(
                 prompt=examples["_prompt"][i],
@@ -104,13 +164,15 @@ class SupervisedDatasetProcessor(DatasetProcessor):
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
+                mask_history_sample=mask_history_sample,
             )
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
-            model_inputs["images"].append(examples["_images"][i])
-            model_inputs["videos"].append(examples["_videos"][i])
-            model_inputs["audios"].append(examples["_audios"][i])
+            # Ensure consistent types: convert None to empty list for media fields
+            model_inputs["images"].append(examples["_images"][i] if examples["_images"][i] is not None else [])
+            model_inputs["videos"].append(examples["_videos"][i] if examples["_videos"][i] is not None else [])
+            model_inputs["audios"].append(examples["_audios"][i] if examples["_audios"][i] is not None else [])
 
         return model_inputs
 
@@ -133,9 +195,21 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
         lengths = []
         length2indexes = defaultdict(list)
         for i in range(len(examples["_prompt"])):
-            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+            # Check if this sample is from mask_history_sample splitting
+            mask_history_sample = examples.get("_mask_history_sample", [False] * len(examples["_prompt"]))[i]
+            
+            # Validation: for standard format, prompt should have odd length (ends with user)
+            # For mask_history_sample, this validation is skipped
+            if not mask_history_sample:
+                if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+                    logger.warning_rank0(
+                        "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    )
+                    continue
+            
+            if len(examples["_response"][i]) != 1:
                 logger.warning_rank0(
-                    "Dropped invalid example: {}".format(examples["_prompt"][i] + examples["_response"][i])
+                    "Dropped invalid example: response should have exactly one message. Got: {}".format(examples["_prompt"][i] + examples["_response"][i])
                 )
                 continue
 
@@ -147,6 +221,7 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
                 images=examples["_images"][i] or [],
                 videos=examples["_videos"][i] or [],
                 audios=examples["_audios"][i] or [],
+                mask_history_sample=mask_history_sample,
             )
             length = len(input_ids)
             if length > self.data_args.cutoff_len:
@@ -156,9 +231,10 @@ class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
                 length2indexes[length].append(valid_num)
                 batch_input_ids.append(input_ids)
                 batch_labels.append(labels)
-                batch_images.append(examples["_images"][i] or [])
-                batch_videos.append(examples["_videos"][i] or [])
-                batch_audios.append(examples["_audios"][i] or [])
+                # Ensure consistent types: convert None to empty list for media fields
+                batch_images.append(examples["_images"][i] if examples["_images"][i] is not None else [])
+                batch_videos.append(examples["_videos"][i] if examples["_videos"][i] is not None else [])
+                batch_audios.append(examples["_audios"][i] if examples["_audios"][i] is not None else [])
                 valid_num += 1
 
         model_inputs = defaultdict(list)

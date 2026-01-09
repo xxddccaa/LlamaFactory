@@ -63,6 +63,9 @@ class DatasetAttr:
     observation_tag: str | None = "observation"
     function_tag: str | None = "function_call"
     system_tag: str | None = "system"
+    # sample processing configs
+    mask_history_sample: bool = False
+    max_human_steps: int = -1
 
     def __repr__(self) -> str:
         return self.dataset_name
@@ -91,9 +94,106 @@ class DatasetAttr:
             for tag in tag_names:
                 self.set_attr(tag, attr["tags"])
 
+        # Set sample processing configs
+        self.set_attr("mask_history_sample", attr, default=False)
+        self.set_attr("max_human_steps", attr, default=-1)
+
+        # Validate mask_history_sample and max_human_steps
+        # They must be set together (both default or both non-default)
+        has_mask_history = self.mask_history_sample != False
+        has_max_steps = self.max_human_steps != -1
+
+        if has_mask_history != has_max_steps:
+            raise ValueError(
+                f"mask_history_sample and max_human_steps must be set together. "
+                f"Got mask_history_sample={self.mask_history_sample}, max_human_steps={self.max_human_steps}. "
+                f"Either both should use default values (mask_history_sample=False, max_human_steps=-1) "
+                f"or both should be set explicitly."
+            )
+
+        if has_max_steps and self.max_human_steps < 1:
+            raise ValueError(
+                f"max_human_steps must be >= 1 when set. Got max_human_steps={self.max_human_steps}."
+            )
+
+
+def _parse_dataset_path_with_config(path_with_config: str) -> tuple[str, dict[str, Any]]:
+    r"""Parse dataset path with optional configuration in brackets.
+    
+    Supports syntax like:
+    - /mnt/data.json[media_dir=/mnt/images]
+    - /mnt/data.json[media_dir=/mnt/images,formatting=alpaca]
+    - s3://bucket/data.json[media_dir=s3://bucket/images,user_tag=user]
+    
+    Returns:
+        tuple: (file_path, config_dict)
+    """
+    # Check if there's a config section in brackets
+    if '[' not in path_with_config:
+        return path_with_config, {}
+    
+    # Find the last '[' to handle paths that might contain '['
+    bracket_start = path_with_config.rfind('[')
+    if bracket_start == -1 or not path_with_config.endswith(']'):
+        return path_with_config, {}
+    
+    file_path = path_with_config[:bracket_start]
+    config_str = path_with_config[bracket_start+1:-1]  # Remove [ and ]
+    
+    if not config_str.strip():
+        return file_path, {}
+    
+    # Parse config string: "key1=value1,key2=value2"
+    config_dict = {}
+    # Split by comma, but be careful with values that might contain commas in paths
+    parts = []
+    current_part = []
+    in_value = False
+    
+    for char in config_str:
+        if char == '=' and not in_value:
+            in_value = True
+            current_part.append(char)
+        elif char == ',' and in_value:
+            # Check if this is likely a path separator (followed by space or another key)
+            # For simplicity, we assume ',' separates key-value pairs
+            parts.append(''.join(current_part))
+            current_part = []
+            in_value = False
+        else:
+            current_part.append(char)
+    
+    if current_part:
+        parts.append(''.join(current_part))
+    
+    for part in parts:
+        part = part.strip()
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        value = value.strip()
+        
+        # Convert boolean strings
+        if value.lower() == 'true':
+            value = True
+        elif value.lower() == 'false':
+            value = False
+        # Convert numeric strings
+        elif value.isdigit():
+            value = int(value)
+        
+        config_dict[key] = value
+    
+    return file_path, config_dict
+
 
 def _is_file_path(path: str) -> bool:
-    r"""Check if the path is a file path (local or remote)."""
+    r"""Check if the path is a file path (local or remote).
+    
+    Note: This function should be called after _parse_dataset_path_with_config
+    to remove any bracketed configuration.
+    """
     # Check for remote paths (s3://, oss://, gs://, gcs://, etc.)
     if path.startswith(("s3://", "oss://", "s3:/", "oss:/", "gs://", "gcs://")):
         return True
@@ -141,7 +241,11 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
             # Only raise error if there are dataset_names that are not file paths
             if len(dataset_names) != 0:
                 # Check if any dataset_names are not file paths (need dataset_info.json)
-                has_non_file_paths = any(not _is_file_path(name) for name in dataset_names)
+                # Parse paths first to remove inline config before checking
+                has_non_file_paths = any(
+                    not _is_file_path(_parse_dataset_path_with_config(name)[0]) 
+                    for name in dataset_names
+                )
                 if has_non_file_paths:
                     raise ValueError(f"Cannot open {config_path} due to {str(err)}.")
                 # All are file paths, can handle directly
@@ -151,19 +255,58 @@ def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict) -
 
     dataset_list: list[DatasetAttr] = []
     for name in dataset_names:
+        # Parse dataset path with optional configuration
+        # Supports syntax like: /mnt/data.json[media_dir=/mnt/images,formatting=alpaca]
+        file_path, inline_config = _parse_dataset_path_with_config(name)
+        
         # First check if name is a file path (allowing mixed usage)
-        if _is_file_path(name):
+        if _is_file_path(file_path):
             # Direct file path: use file loader with default sharegpt format
             dataset_attr = DatasetAttr(
                 load_from="file",
-                dataset_name=name,
-                formatting="sharegpt",
-                messages="conversations",
-                role_tag="from",
-                content_tag="value",
-                user_tag="human",
-                assistant_tag="gpt",
+                dataset_name=file_path,
+                formatting=inline_config.get("formatting", "sharegpt"),
+                messages=inline_config.get("messages", "conversations"),
+                role_tag=inline_config.get("role_tag", "from"),
+                content_tag=inline_config.get("content_tag", "value"),
+                user_tag=inline_config.get("user_tag", "human"),
+                assistant_tag=inline_config.get("assistant_tag", "gpt"),
             )
+            
+            # Apply additional inline configurations
+            if "media_dir" in inline_config:
+                dataset_attr.media_dir = inline_config["media_dir"]
+            if "images" in inline_config:
+                dataset_attr.images = inline_config["images"]
+            if "videos" in inline_config:
+                dataset_attr.videos = inline_config["videos"]
+            if "audios" in inline_config:
+                dataset_attr.audios = inline_config["audios"]
+            if "system" in inline_config:
+                dataset_attr.system = inline_config["system"]
+            if "tools" in inline_config:
+                dataset_attr.tools = inline_config["tools"]
+            if "mask_history_sample" in inline_config:
+                dataset_attr.mask_history_sample = inline_config["mask_history_sample"]
+            if "max_human_steps" in inline_config:
+                dataset_attr.max_human_steps = inline_config["max_human_steps"]
+            
+            # Validate mask_history_sample and max_human_steps
+            has_mask_history = dataset_attr.mask_history_sample != False
+            has_max_steps = dataset_attr.max_human_steps != -1
+            if has_mask_history != has_max_steps:
+                raise ValueError(
+                    f"For dataset {file_path}: mask_history_sample and max_human_steps must be set together. "
+                    f"Got mask_history_sample={dataset_attr.mask_history_sample}, max_human_steps={dataset_attr.max_human_steps}. "
+                    f"Either both should use default values (mask_history_sample=False, max_human_steps=-1) "
+                    f"or both should be set explicitly."
+                )
+            if has_max_steps and dataset_attr.max_human_steps < 1:
+                raise ValueError(
+                    f"For dataset {file_path}: max_human_steps must be >= 1 when set. "
+                    f"Got max_human_steps={dataset_attr.max_human_steps}."
+                )
+            
             dataset_list.append(dataset_attr)
             continue
 
