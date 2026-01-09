@@ -1,0 +1,50 @@
+model_name_or_path: /data/xiedong/Qwen3-VL-2B-Instruct
+dataset_dir: /data/xiedong/mmdu/mmdu_val
+cache_dir: /data/xiedong/mmdu/cache_dir
+tokenized_path: /data/xiedong/mmdu/tokenized_cache1
+overwrite_cache: true
+dataset: mmdu_val
+template: qwen3_vl
+image_max_pixels: 451584
+video_max_pixels: 16384
+trust_remote_code: true
+
+do_train: true
+stage: sft
+finetuning_type: full
+freeze_vision_tower: false
+freeze_multi_modal_projector: false
+freeze_language_model: false
+cutoff_len: 8196
+
+output_dir: /data/xiedong/mmdu/output
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+num_train_epochs: 1.0
+learning_rate: 1.0e-6
+lr_scheduler_type: cosine
+bf16: true
+flash_attn: auto
+
+preprocessing_num_workers: 8
+preprocessing_batch_size: 8
+dataloader_num_workers: 8
+logging_steps: 10
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: false
+save_steps: 500
+save_strategy: steps
+report_to: none
+data_shared_file_system: true
+ddp_timeout: 180000000
+
+# Megatron 并行配置
+# 注意：pipeline_model_parallel_size * tensor_model_parallel_size 必须 <= 可用 GPU 数量
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+sequence_parallel: false
+bias_activation_fusion: true
+apply_rope_fusion: true
+use_distributed_optimizer: true
+# USE_MCA=1 llamafactory-cli train examples/megatron/qwen3_vl_mmdu_full.yaml

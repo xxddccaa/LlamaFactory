@@ -11,7 +11,7 @@ docker push ${NAME}
 内网机器：
 ```
 NAME=kevinchina/deeplearning:llamafactory0-9-4-base-1-megatron-1-ok-tars2
-NAME2=hub.i.x.com/g-xiedong-fine/llamafactory0-9-4-base-1-megatron-1-ok-tars1:v2
+NAME2=hub.i.basemind.com/g-xiedong-fine/llamafactory0-9-4-base-1-megatron-1-ok-tars1:v2
 docker pull ${NAME}
 docker tag ${NAME} ${NAME2}
 docker push ${NAME2}
