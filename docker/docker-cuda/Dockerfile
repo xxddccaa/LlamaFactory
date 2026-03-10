@@ -65,10 +65,6 @@ RUN pip config set global.index-url "${PIP_INDEX}" && \
 # Copy the application into the image
 COPY . /app
 
-# Install LLaMA Factory
-RUN pip install --no-cache-dir --no-build-isolation --upgrade-strategy only-if-needed -e . && \
-    pip install --no-cache-dir --no-build-isolation --upgrade-strategy only-if-needed -r requirements/metrics.txt -r requirements/deepspeed.txt
-
 # Rebuild flash attention
 RUN if [ "${INSTALL_FLASHATTN}" == "true" ]; then \
         pip uninstall -y ninja && \
@@ -76,17 +72,22 @@ RUN if [ "${INSTALL_FLASHATTN}" == "true" ]; then \
         pip install --no-cache-dir flash-attn --no-build-isolation; \
     fi
 
-# Customize bash prompt
-RUN echo 'export PS1="\\[\\e[1;31m\\]\\D{%a %m月 %d} \\[\\e[0m\\]# \\[\\e[1;32m\\]\\t \\[\\e[0m\\]# \\[\\e[1;34m\\]\\w \\[\\e[0m\\]# "' >> /root/.bashrc
-
-
-
-
 RUN apt-get update && apt-get install -y ffmpeg sox libsox-dev
 
 RUN pip install --no-cache-dir --no-build-isolation swanlab soundfile librosa audioread
 
 RUN pip install --no-cache-dir --no-build-isolation -r requirements/minicpm-v.txt
+
+
+# Install LLaMA Factory
+RUN pip install --no-cache-dir --no-build-isolation --upgrade-strategy only-if-needed -e . && \
+    pip install --no-cache-dir --no-build-isolation --upgrade-strategy only-if-needed -r requirements/metrics.txt -r requirements/deepspeed.txt
+
+
+# Customize bash prompt
+RUN echo 'export PS1="\\[\\e[1;31m\\]\\D{%a %m月 %d} \\[\\e[0m\\]# \\[\\e[1;32m\\]\\t \\[\\e[0m\\]# \\[\\e[1;34m\\]\\w \\[\\e[0m\\]# "' >> /root/.bashrc
+
+
 # Set up volumes
 # VOLUME [ "/root/.cache/huggingface", "/app/shared_data", "/app/output" ]
 
