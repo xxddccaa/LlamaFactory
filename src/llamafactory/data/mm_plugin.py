@@ -35,7 +35,15 @@ from transformers.models.mllama.processing_mllama import (
 from typing_extensions import override
 
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER
+from ..extras.logging import get_logger
 from ..extras.packages import is_pillow_available, is_pyav_available, is_transformers_version_greater_than
+
+
+logger = get_logger(__name__)
+
+# 前 N 条多模态样本打印 token 统计（仅 Qwen2OmniPlugin / qwen3_omni_nothink）
+_OMNI_PLUGIN_LOG_MAX = 5
+_omni_plugin_log_count = 0
 
 
 if is_pillow_available():
@@ -1899,16 +1907,22 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             mm_inputs["video_second_per_grid"] = torch.tensor(
                 [temporal_patch_size / fps for fps in video_dict["fps_per_video"]]
             )
+            # 暂存 debug 元信息，供 process_messages 打日志用（不参与模型 forward）
+            mm_inputs["_debug_video_durations"] = video_dict.get("durations", [])
+            mm_inputs["_debug_video_num_frames"] = [len(f) for f in video_dict["videos"]]
+            if video_dict["videos"] and video_dict["videos"][0]:
+                first_frame = video_dict["videos"][0][0]
+                mm_inputs["_debug_video_frame_size"] = (first_frame.width, first_frame.height)
 
         if len(audios) != 0:
-            audios = self._regularize_audios(
-                audios,
-                sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
-            )["audios"]
+            sampling_rate = getattr(processor, "audio_sampling_rate", 16000)
+            audios = self._regularize_audios(audios, sampling_rate=sampling_rate)["audios"]
+            # 暂存音频时长（已转为 numpy array，len(a)/sr = 秒数）
+            mm_inputs["_debug_audio_durations"] = [len(a) / sampling_rate for a in audios]
             mm_inputs.update(
                 feature_extractor(
                     audios,
-                    sampling_rate=getattr(processor, "audio_sampling_rate", 16000),
+                    sampling_rate=sampling_rate,
                     return_attention_mask=True,
                     padding="max_length",
                     return_tensors="pt",
@@ -1953,6 +1967,16 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
             image_grid_thw = [None] * len(images)
             video_grid_thw = [None] * len(videos)
             audio_lengths = [None] * len(audios)
+
+        # 取出由 _get_mm_inputs 暂存的 debug 元信息（pop 掉，不传给模型 forward）
+        _debug_video_durations: list = mm_inputs.pop("_debug_video_durations", [])
+        _debug_video_num_frames: list = mm_inputs.pop("_debug_video_num_frames", [])
+        _debug_video_frame_size = mm_inputs.pop("_debug_video_frame_size", None)
+        _debug_audio_durations: list = mm_inputs.pop("_debug_audio_durations", [])
+
+        # 记录每个 placeholder 展开后的 token 数量，用于日志
+        per_video_tokens: list[int] = []
+        per_audio_tokens: list[int] = []
 
         for message in messages:
             content = message["content"]
@@ -2011,6 +2035,8 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                     placeholder_string += self.audio_eos_token + self.vision_eos_token
                     content = content.replace(VIDEO_PLACEHOLDER, placeholder_string, 1)
                     content = content.replace(AUDIO_PLACEHOLDER, "", 1)
+                    per_video_tokens.append(sum(int(vi[1]) - int(vi[0]) for vi in video_chunk_indices))
+                    per_audio_tokens.append(sum(int(ai[1]) - int(ai[0]) for ai in audio_chunk_indices))
                     num_audio_tokens += 1
                     num_video_tokens += 1
             else:
@@ -2021,6 +2047,7 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                         f"{self.audio_bos_token}{self.audio_token * audio_seqlen}{self.audio_eos_token}",
                         1,
                     )
+                    per_audio_tokens.append(int(audio_seqlen))
                     num_audio_tokens += 1
 
                 while VIDEO_PLACEHOLDER in content:
@@ -2032,9 +2059,41 @@ class Qwen2OmniPlugin(Qwen2VLPlugin):
                         f"{self.vision_bos_token}{self.video_token * video_seqlen}{self.vision_eos_token}",
                         1,
                     )
+                    per_video_tokens.append(int(video_seqlen))
                     num_video_tokens += 1
 
             message["content"] = content
+
+        # ---------- token 统计日志（只打前 _OMNI_PLUGIN_LOG_MAX 条样本） ----------
+        global _omni_plugin_log_count
+        if _omni_plugin_log_count < _OMNI_PLUGIN_LOG_MAX and (videos or audios):
+            _omni_plugin_log_count += 1
+            lines = [f"[OmniPlugin] sample #{_omni_plugin_log_count} multimodal token stats  (use_audio_in_video={use_audio_in_video}):"]
+
+            for i, dur in enumerate(_debug_video_durations):
+                nf = _debug_video_num_frames[i] if i < len(_debug_video_num_frames) else "?"
+                vt = per_video_tokens[i] if i < len(per_video_tokens) else "?"
+                lines.append(f"  video[{i}]: duration={dur:.2f}s  sampled_frames={nf}  video_tokens={vt}")
+
+            if _debug_video_frame_size:
+                lines.append(f"  video frame size after resize: {_debug_video_frame_size[0]}x{_debug_video_frame_size[1]} px")
+
+            if self.expand_mm_tokens and len(video_grid_thw) > 0:
+                for i, thw in enumerate(video_grid_thw):
+                    thw_list = thw.tolist() if hasattr(thw, "tolist") else thw
+                    lines.append(f"  video[{i}] grid_thw (T,H_patches,W_patches)={thw_list}  (T*H*W // merge_size^2 = video_tokens)")
+
+            for i, dur in enumerate(_debug_audio_durations):
+                at = per_audio_tokens[i] if i < len(per_audio_tokens) else "?"
+                lines.append(f"  audio[{i}]: duration={dur:.2f}s  audio_tokens={at}")
+
+            total_vt = sum(per_video_tokens)
+            total_at = sum(per_audio_tokens)
+            if total_vt or total_at:
+                lines.append(f"  TOTAL: video_tokens={total_vt}  audio_tokens={total_at}  mm_tokens={total_vt + total_at}")
+
+            logger.info_rank0("\n".join(lines))
+        # -----------------------------------------------------------------------
 
         return messages
 
