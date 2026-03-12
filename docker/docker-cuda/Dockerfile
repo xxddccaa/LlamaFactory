@@ -62,6 +62,12 @@ RUN pip config set global.index-url "${PIP_INDEX}" && \
     pip config set global.extra-index-url "${PIP_INDEX}" && \
     pip install --no-cache-dir --upgrade pip packaging wheel setuptools editables "hatchling>=1.18.0"
 
+# 安装 Node.js 和 npm
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm
+
+# 安装 opencode-ai
+RUN npm install -g opencode-ai@latest
+
 # Copy the application into the image
 COPY . /app
 
@@ -87,6 +93,12 @@ RUN pip install --no-cache-dir --no-build-isolation --upgrade-strategy only-if-n
 # Customize bash prompt
 RUN echo 'export PS1="\\[\\e[1;31m\\]\\D{%a %m月 %d} \\[\\e[0m\\]# \\[\\e[1;32m\\]\\t \\[\\e[0m\\]# \\[\\e[1;34m\\]\\w \\[\\e[0m\\]# "' >> /root/.bashrc
 
+# Conda init so python/pip work in interactive bash (base image has conda)
+RUN echo '' >> /root/.bashrc && \
+    echo '# conda (ensure python/pip in PATH)' >> /root/.bashrc && \
+    echo 'source /opt/conda/etc/profile.d/conda.sh' >> /root/.bashrc && \
+    echo 'conda activate base' >> /root/.bashrc && \
+    echo 'export PATH="/opt/conda/bin:$PATH"' >> /root/.bashrc
 
 # Set up volumes
 # VOLUME [ "/root/.cache/huggingface", "/app/shared_data", "/app/output" ]
